@@ -15,7 +15,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-const CONFIG_DIR = path.join(os.homedir(), ".config", "mcp-tiktok");
+// Allow override via env var so tests can use a temp directory
+const CONFIG_DIR =
+  process.env.TIKTOK_CONFIG_DIR ?? path.join(os.homedir(), ".config", "mcp-tiktok");
 const TOKEN_FILE = path.join(CONFIG_DIR, "tokens.json");
 
 interface StoredTokens {
