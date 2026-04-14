@@ -1,0 +1,39 @@
+{
+  "name": "mcp-tiktok",
+  "version": "1.0.0",
+  "description": "MCP server for TikTok Content Posting API – automate video and image posting",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-tiktok": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.7.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "tiktok",
+    "content-posting",
+    "automation",
+    "video",
+    "image"
+  ],
+  "license": "MIT"
+}
