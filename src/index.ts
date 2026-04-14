@@ -1,10 +1,58 @@
 #!/usr/bin/env node
+/**
+ * TikTok MCP Server
+ *
+ * Security model
+ * ──────────────
+ * • App credentials (client_key, client_secret) are read ONLY from environment
+ *   variables – they are never accepted as tool parameters.
+ * • Access tokens are stored in ~/.config/mcp-tiktok/tokens.json (mode 0o600)
+ *   after the OAuth flow and retrieved automatically by every tool that needs
+ *   them.  The token values themselves are never returned to the MCP client.
+ *
+ * Required env vars
+ * ─────────────────
+ *   TIKTOK_CLIENT_KEY      – your app's client key
+ *   TIKTOK_CLIENT_SECRET   – your app's client secret
+ *   TIKTOK_REDIRECT_URI    – optional default redirect URI
+ *   TIKTOK_ACCESS_TOKEN    – optional override (skips token file, useful in CI)
+ */
+
+// Load .env for local development (silently ignored if the file is absent)
+import { readFileSync, existsSync } from "fs";
+import { resolve } from "path";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const dotenvPath = resolve(__dirname, "..", ".env");
+if (existsSync(dotenvPath)) {
+  for (const line of readFileSync(dotenvPath, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && !(key in process.env)) process.env[key] = val;
+  }
+}
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as fs from "fs";
+
 import { buildAuthUrl, generatePKCE, generateState, DEFAULT_SCOPES } from "./auth.js";
 import { TikTokClient, calcVideoChunks } from "./tiktok-client.js";
+import { getClientKey, getClientSecret, getRedirectUri } from "./config.js";
+import {
+  saveTokens,
+  getAccessToken,
+  getRefreshToken,
+  getTokenInfo,
+  clearTokens,
+} from "./token-store.js";
 import type { PrivacyLevel, PostMode } from "./types.js";
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -14,7 +62,7 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-// ─── Shared enums ─────────────────────────────────────────────────────────────
+// ─── Shared schema constants ──────────────────────────────────────────────────
 
 const PRIVACY_LEVELS = [
   "PUBLIC_TO_EVERYONE",
@@ -25,7 +73,7 @@ const PRIVACY_LEVELS = [
 
 const POST_MODES = ["DIRECT_POST", "MEDIA_UPLOAD"] as const;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Response helpers ─────────────────────────────────────────────────────────
 
 function ok(data: unknown) {
   return {
@@ -55,45 +103,48 @@ async function run<T>(
 server.tool(
   "tiktok_get_auth_url",
   [
-    "Generate a TikTok OAuth 2.0 authorization URL with PKCE.",
-    "Steps:",
-    "1. Call this tool to get auth_url + code_verifier + state.",
-    "2. Open auth_url in a browser, log in, and authorize the app.",
-    "3. Copy the 'code' parameter from the redirect URL.",
-    "4. Call tiktok_exchange_code with code + code_verifier.",
+    "Generate a TikTok OAuth 2.0 authorization URL (with PKCE).",
+    "App credentials are read from TIKTOK_CLIENT_KEY / TIKTOK_REDIRECT_URI env vars.",
+    "Steps: 1) Call this tool. 2) Open auth_url in a browser and authorize.",
+    "3) Copy the 'code' from the redirect URL. 4) Call tiktok_exchange_code.",
   ].join(" "),
   {
-    client_key: z
-      .string()
-      .describe("TikTok app client key (from https://developers.tiktok.com)"),
     redirect_uri: z
       .string()
-      .describe("OAuth redirect URI registered in the developer portal"),
+      .optional()
+      .describe(
+        "OAuth redirect URI (overrides TIKTOK_REDIRECT_URI env var). " +
+          "Must be registered in the TikTok developer portal.",
+      ),
     scopes: z
       .array(z.string())
       .optional()
       .describe(
-        `OAuth scopes to request. Defaults to ${DEFAULT_SCOPES.join(", ")}. ` +
-          "Add 'video.list' to list videos.",
+        `OAuth scopes. Defaults to: ${DEFAULT_SCOPES.join(", ")}`,
       ),
   },
-  async ({ client_key, redirect_uri, scopes }) => {
+  async ({ redirect_uri, scopes }) => {
     return run(async () => {
+      const clientKey = getClientKey();
+      const resolvedUri = getRedirectUri(redirect_uri);
       const { codeVerifier, codeChallenge } = generatePKCE();
       const state = generateState();
       const authUrl = buildAuthUrl({
-        clientKey: client_key,
-        redirectUri: redirect_uri,
+        clientKey,
+        redirectUri: resolvedUri,
         scopes: scopes && scopes.length > 0 ? scopes : DEFAULT_SCOPES,
         codeChallenge,
         state,
       });
       return {
         auth_url: authUrl,
+        // code_verifier is not a secret but must be stored by the caller until
+        // tiktok_exchange_code is called – it is safe to return here.
         code_verifier: codeVerifier,
         state,
         next_step:
-          "Open auth_url in a browser. After authorizing, extract the 'code' query parameter from the redirect URL and call tiktok_exchange_code.",
+          "Open auth_url in a browser. After authorizing, copy the 'code' " +
+          "query parameter from the redirect URL and call tiktok_exchange_code.",
       };
     });
   },
@@ -103,33 +154,49 @@ server.tool(
 
 server.tool(
   "tiktok_exchange_code",
-  "Exchange a TikTok OAuth authorization code for an access token and refresh token.",
+  [
+    "Exchange the OAuth authorization code for access + refresh tokens.",
+    "Credentials are read from env vars; tokens are saved to",
+    "~/.config/mcp-tiktok/tokens.json (mode 0600) and NEVER returned to the client.",
+  ].join(" "),
   {
-    client_key: z.string().describe("TikTok app client key"),
-    client_secret: z.string().describe("TikTok app client secret"),
     code: z
       .string()
       .describe("Authorization code from the OAuth redirect URL"),
     redirect_uri: z
       .string()
+      .optional()
       .describe("Must match the redirect_uri used in tiktok_get_auth_url"),
     code_verifier: z
       .string()
       .describe("PKCE code_verifier returned by tiktok_get_auth_url"),
   },
-  async ({ client_key, client_secret, code, redirect_uri, code_verifier }) => {
+  async ({ code, redirect_uri, code_verifier }) => {
     return run(async () => {
+      const clientKey = getClientKey();
+      const clientSecret = getClientSecret();
+      const resolvedUri = getRedirectUri(redirect_uri);
+
       const client = new TikTokClient();
       const tokens = await client.exchangeCode({
-        clientKey: client_key,
-        clientSecret: client_secret,
+        clientKey,
+        clientSecret,
         code,
-        redirectUri: redirect_uri,
+        redirectUri: resolvedUri,
         codeVerifier: code_verifier,
       });
+
+      saveTokens(tokens);
+
+      // Return metadata only – token values stay on disk
       return {
-        ...tokens,
-        note: "Store access_token and refresh_token securely. access_token expires in expires_in seconds.",
+        success: true,
+        open_id: tokens.open_id,
+        scope: tokens.scope,
+        expires_in_seconds: tokens.expires_in,
+        token_stored_at: "~/.config/mcp-tiktok/tokens.json",
+        message:
+          "Tokens saved securely. You can now use the other tiktok_* tools without providing credentials.",
       };
     });
   },
@@ -139,22 +206,34 @@ server.tool(
 
 server.tool(
   "tiktok_refresh_token",
-  "Refresh an expired TikTok access token using the refresh token.",
-  {
-    client_key: z.string().describe("TikTok app client key"),
-    client_secret: z.string().describe("TikTok app client secret"),
-    refresh_token: z
-      .string()
-      .describe("Refresh token from a previous token exchange"),
-  },
-  async ({ client_key, client_secret, refresh_token }) => {
+  [
+    "Refresh the stored access token using the stored refresh token.",
+    "Reads credentials from env vars and the current refresh token from the token file.",
+    "Saves the new tokens back to the token file.",
+  ].join(" "),
+  {},
+  async () => {
     return run(async () => {
+      const clientKey = getClientKey();
+      const clientSecret = getClientSecret();
+      const refreshToken = getRefreshToken();
+
       const client = new TikTokClient();
-      return client.refreshToken({
-        clientKey: client_key,
-        clientSecret: client_secret,
-        refreshToken: refresh_token,
+      const tokens = await client.refreshToken({
+        clientKey,
+        clientSecret,
+        refreshToken,
       });
+
+      saveTokens(tokens);
+
+      return {
+        success: true,
+        open_id: tokens.open_id,
+        scope: tokens.scope,
+        expires_in_seconds: tokens.expires_in,
+        message: "Access token refreshed and saved.",
+      };
     });
   },
 );
@@ -163,91 +242,85 @@ server.tool(
 
 server.tool(
   "tiktok_revoke_token",
-  "Revoke a TikTok access token or refresh token.",
-  {
-    client_key: z.string().describe("TikTok app client key"),
-    client_secret: z.string().describe("TikTok app client secret"),
-    token: z.string().describe("The access token or refresh token to revoke"),
-  },
-  async ({ client_key, client_secret, token }) => {
+  "Revoke the stored access token and delete the local token file.",
+  {},
+  async () => {
     return run(async () => {
+      const clientKey = getClientKey();
+      const clientSecret = getClientSecret();
+      const accessToken = getAccessToken();
+
       const client = new TikTokClient();
-      await client.revokeToken({
-        clientKey: client_key,
-        clientSecret: client_secret,
-        token,
-      });
-      return { success: true, message: "Token revoked successfully." };
+      await client.revokeToken({ clientKey, clientSecret, token: accessToken });
+      clearTokens();
+
+      return {
+        success: true,
+        message: "Token revoked and local token file deleted.",
+      };
     });
   },
 );
 
-// ─── Tool 5: Query creator info ───────────────────────────────────────────────
+// ─── Tool 5: Token status ─────────────────────────────────────────────────────
+
+server.tool(
+  "tiktok_token_status",
+  "Check whether valid tokens are stored locally (shows metadata, not token values).",
+  {},
+  async () => {
+    return run(async () => getTokenInfo());
+  },
+);
+
+// ─── Tool 6: Query creator info ───────────────────────────────────────────────
 
 server.tool(
   "tiktok_get_creator_info",
   [
-    "Query the TikTok creator's posting capabilities (privacy levels, max video duration, etc.).",
-    "Call this before posting to confirm the creator's available options.",
+    "Query the authenticated creator's posting capabilities",
+    "(available privacy levels, max video duration, etc.).",
+    "Call this before posting to confirm the creator's options.",
   ].join(" "),
-  {
-    access_token: z.string().describe("TikTok user access token"),
-  },
-  async ({ access_token }) => {
+  {},
+  async () => {
     return run(async () => {
-      const client = new TikTokClient(access_token);
+      const client = new TikTokClient(getAccessToken());
       return client.getCreatorInfo();
     });
   },
 );
 
-// ─── Tool 6: Post video ───────────────────────────────────────────────────────
+// ─── Tool 7: Post video ───────────────────────────────────────────────────────
 
 server.tool(
   "tiktok_post_video",
   [
-    "Post a video to a TikTok creator's account.",
-    "Supports two upload methods:",
-    "(a) PULL_FROM_URL – provide a public video_url from a verified domain; TikTok fetches it.",
-    "(b) FILE_UPLOAD   – provide a local video_path; the file is uploaded in 10 MB chunks.",
-    "Returns a publish_id. Use tiktok_check_post_status to track progress.",
+    "Post a video to the authenticated creator's TikTok account.",
+    "Upload methods:",
+    "(a) PULL_FROM_URL – provide video_url pointing to a verified domain; TikTok fetches it.",
+    "(b) FILE_UPLOAD   – provide video_path (local file); uploaded in 10 MB chunks.",
+    "Returns a publish_id. Use tiktok_check_post_status to monitor progress.",
   ].join(" "),
   {
-    access_token: z
-      .string()
-      .describe("TikTok user access token (requires video.publish scope)"),
     title: z
       .string()
       .max(2200)
-      .describe("Video caption / title (max 2200 characters, hashtags supported)"),
+      .describe("Video caption / title (max 2200 chars, hashtags and @mentions supported)"),
     privacy_level: z
       .enum(PRIVACY_LEVELS)
-      .describe("Visibility of the post. Check tiktok_get_creator_info for available options."),
+      .describe("Visibility. Run tiktok_get_creator_info to see available options for this creator."),
     video_url: z
       .string()
       .optional()
-      .describe(
-        "PULL_FROM_URL: publicly accessible URL of the video (must be from a verified domain)",
-      ),
+      .describe("PULL_FROM_URL: public video URL from a verified domain"),
     video_path: z
       .string()
       .optional()
       .describe("FILE_UPLOAD: absolute path to a local MP4 video file"),
-    disable_duet: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Prevent others from creating Duets with this video"),
-    disable_comment: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Disable comments on this video"),
-    disable_stitch: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Prevent others from Stitching this video"),
+    disable_duet: z.boolean().optional().default(false),
+    disable_comment: z.boolean().optional().default(false),
+    disable_stitch: z.boolean().optional().default(false),
     video_cover_timestamp_ms: z
       .number()
       .int()
@@ -266,7 +339,6 @@ server.tool(
       .describe("Mark as organic brand content"),
   },
   async ({
-    access_token,
     title,
     privacy_level,
     video_url,
@@ -280,17 +352,13 @@ server.tool(
   }) => {
     return run(async () => {
       if (!video_url && !video_path) {
-        throw new Error(
-          "Provide either video_url (PULL_FROM_URL) or video_path (FILE_UPLOAD).",
-        );
+        throw new Error("Provide either video_url (PULL_FROM_URL) or video_path (FILE_UPLOAD).");
       }
       if (video_url && video_path) {
-        throw new Error(
-          "Provide either video_url or video_path, not both.",
-        );
+        throw new Error("Provide either video_url or video_path, not both.");
       }
 
-      const client = new TikTokClient(access_token);
+      const client = new TikTokClient(getAccessToken());
 
       const postInfo = {
         title,
@@ -304,7 +372,6 @@ server.tool(
       };
 
       if (video_url) {
-        // PULL_FROM_URL – TikTok downloads the video itself
         const result = await client.initVideoPost({
           post_info: postInfo,
           source_info: { source: "PULL_FROM_URL", video_url },
@@ -313,15 +380,15 @@ server.tool(
           publish_id: result.publish_id,
           source: "PULL_FROM_URL",
           message:
-            "Video post initiated. TikTok is pulling the video from the URL. " +
-            "Poll tiktok_check_post_status with the publish_id to track progress.",
+            "Video post initiated. TikTok is downloading the video from the URL. " +
+            "Call tiktok_check_post_status to monitor progress.",
         };
       }
 
-      // FILE_UPLOAD – chunk upload to TikTok CDN
       if (!fs.existsSync(video_path!)) {
         throw new Error(`Video file not found: ${video_path}`);
       }
+
       const videoSize = fs.statSync(video_path!).size;
       const { chunkSize, totalChunkCount } = calcVideoChunks(videoSize);
 
@@ -344,40 +411,33 @@ server.tool(
         chunks_uploaded: totalChunkCount,
         message:
           "Video uploaded. TikTok is processing it asynchronously. " +
-          "Poll tiktok_check_post_status with the publish_id to track progress.",
+          "Call tiktok_check_post_status to monitor progress.",
       };
     });
   },
 );
 
-// ─── Tool 7: Post photos ──────────────────────────────────────────────────────
+// ─── Tool 8: Post images ──────────────────────────────────────────────────────
 
 server.tool(
   "tiktok_post_images",
   [
-    "Post a single photo or a photo carousel to a TikTok creator's account.",
-    "Image URLs must be from a verified domain or URL prefix (PULL_FROM_URL only).",
-    "Supports up to 35 images. photo_cover_index is 1-based (1 = first image).",
-    "Returns a publish_id. Use tiktok_check_post_status to track progress.",
+    "Post a photo or carousel (up to 35 images) to the authenticated creator's TikTok.",
+    "Image URLs must be from a verified domain (PULL_FROM_URL).",
+    "photo_cover_index is 1-based (1 = first image).",
+    "Returns a publish_id. Use tiktok_check_post_status to monitor progress.",
   ].join(" "),
   {
-    access_token: z
-      .string()
-      .describe("TikTok user access token (requires video.publish scope)"),
-    title: z
-      .string()
-      .max(2200)
-      .describe("Post title / caption (max 2200 characters)"),
+    title: z.string().max(2200).describe("Post caption / title (max 2200 chars)"),
     privacy_level: z
       .enum(PRIVACY_LEVELS)
-      .describe("Visibility of the post. Check tiktok_get_creator_info for available options."),
+      .describe("Visibility. Run tiktok_get_creator_info to see available options."),
     image_urls: z
       .array(z.string().url())
       .min(1)
       .max(35)
       .describe(
-        "Array of public image URLs (JPEG, PNG, WEBP) from a verified domain. " +
-          "Up to 35 images for a carousel.",
+        "Public image URLs (JPEG / PNG / WEBP) from a verified domain. Up to 35 for a carousel.",
       ),
     photo_cover_index: z
       .number()
@@ -385,23 +445,14 @@ server.tool(
       .min(1)
       .optional()
       .default(1)
-      .describe("1-based index of the cover image (default: 1 = first image)"),
+      .describe("1-based index of the cover image (default: 1)"),
     post_mode: z
       .enum(POST_MODES)
       .optional()
       .default("DIRECT_POST")
-      .describe(
-        "DIRECT_POST publishes immediately; MEDIA_UPLOAD sends to creator inbox for review",
-      ),
-    description: z
-      .string()
-      .optional()
-      .describe("Optional extended description for the post"),
-    disable_comment: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Disable comments on this post"),
+      .describe("DIRECT_POST publishes immediately; MEDIA_UPLOAD sends to creator inbox"),
+    description: z.string().optional().describe("Extended description for the post"),
+    disable_comment: z.boolean().optional().default(false),
     auto_add_music: z
       .boolean()
       .optional()
@@ -409,7 +460,6 @@ server.tool(
       .describe("Let TikTok automatically add background music"),
   },
   async ({
-    access_token,
     title,
     privacy_level,
     image_urls,
@@ -420,7 +470,7 @@ server.tool(
     auto_add_music,
   }) => {
     return run(async () => {
-      const client = new TikTokClient(access_token);
+      const client = new TikTokClient(getAccessToken());
 
       const result = await client.initPhotoPost({
         post_info: {
@@ -446,32 +496,28 @@ server.tool(
         post_mode: post_mode ?? "DIRECT_POST",
         message:
           "Photo post initiated. " +
-          "Poll tiktok_check_post_status with the publish_id to track progress.",
+          "Call tiktok_check_post_status to monitor progress.",
       };
     });
   },
 );
 
-// ─── Tool 8: Check post status ────────────────────────────────────────────────
+// ─── Tool 9: Check post status ────────────────────────────────────────────────
 
 server.tool(
   "tiktok_check_post_status",
   [
     "Check the publish status of a TikTok post by publish_id.",
-    "Possible statuses: PROCESSING_UPLOAD | PROCESSING_DOWNLOAD | SEND_TO_USER_INBOX | PUBLISH_COMPLETE | FAILED.",
-    "For DIRECT_POST, poll until PUBLISH_COMPLETE to get the final post IDs.",
+    "Statuses: PROCESSING_UPLOAD | PROCESSING_DOWNLOAD | SEND_TO_USER_INBOX | PUBLISH_COMPLETE | FAILED.",
   ].join(" "),
   {
-    access_token: z.string().describe("TikTok user access token"),
     publish_id: z
       .string()
-      .describe(
-        "Publish ID returned by tiktok_post_video or tiktok_post_images",
-      ),
+      .describe("Publish ID returned by tiktok_post_video or tiktok_post_images"),
   },
-  async ({ access_token, publish_id }) => {
+  async ({ publish_id }) => {
     return run(async () => {
-      const client = new TikTokClient(access_token);
+      const client = new TikTokClient(getAccessToken());
       const status = await client.getPublishStatus(publish_id);
       return {
         publish_id,
