@@ -1,7 +1,7 @@
 {
   "name": "mcp-tiktok",
   "version": "1.0.0",
-  "description": "MCP server for TikTok Content Posting API – automate video and image posting",
+  "description": "Full-featured MCP server for TikTok APIs - OAuth, Display API, Content Posting, Research API, Webhooks & more",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

@@ -1,0 +1,70 @@
+class TikTokError extends Error {
+  constructor(message, code, statusCode, details) {
+    super(message);
+    this.code = code;
+    this.statusCode = statusCode;
+    this.details = details;
+    this.name = "TikTokError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "TikTokError", { enumerable: true, configurable: true, get(){ return TikTokError }});
+class OAuthError extends TikTokError {
+  constructor(message, code, statusCode, details) {
+    super(message, `OAUTH_${code}`, statusCode, details);
+    this.name = "OAuthError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "OAuthError", { enumerable: true, configurable: true, get(){ return OAuthError }});
+class TokenExpiredError extends OAuthError {
+  constructor() {
+    super("Access token has expired. Please refresh it.", "TOKEN_EXPIRED");
+    this.name = "TokenExpiredError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "TokenExpiredError", { enumerable: true, configurable: true, get(){ return TokenExpiredError }});
+class InvalidGrantError extends OAuthError {
+  constructor(message, details) {
+    super(message, "INVALID_GRANT", 400, details);
+    this.name = "InvalidGrantError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "InvalidGrantError", { enumerable: true, configurable: true, get(){ return InvalidGrantError }});
+class UnauthorizedError extends TikTokError {
+  constructor() {
+    super("Unauthorized. Please authenticate first.", "UNAUTHORIZED", 401);
+    this.name = "UnauthorizedError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "UnauthorizedError", { enumerable: true, configurable: true, get(){ return UnauthorizedError }});
+class RateLimitError extends TikTokError {
+  constructor(message = "Rate limit exceeded. Please wait before making another request.", retryAfter) {
+    super(message, "RATE_LIMIT_EXCEEDED", 429);
+    this.retryAfter = retryAfter;
+    this.name = "RateLimitError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "RateLimitError", { enumerable: true, configurable: true, get(){ return RateLimitError }});
+class ValidationError extends TikTokError {
+  constructor(message) {
+    super(message, "VALIDATION_ERROR", 400);
+    this.name = "ValidationError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "ValidationError", { enumerable: true, configurable: true, get(){ return ValidationError }});
+class NotFoundError extends TikTokError {
+  constructor(resource) {
+    super(`Resource not found: ${resource}`, "NOT_FOUND", 404);
+    this.name = "NotFoundError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "NotFoundError", { enumerable: true, configurable: true, get(){ return NotFoundError }});
+class ConfigurationError extends TikTokError {
+  constructor(message) {
+    super(message, "CONFIGURATION_ERROR", 500);
+    this.name = "ConfigurationError";
+  }
+}
+Object.defineProperty(__vite_ssr_exports__, "ConfigurationError", { enumerable: true, configurable: true, get(){ return ConfigurationError }});
+
+//# sourceMappingSource=vite-node
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJtYXBwaW5ncyI6IkFBSU8sTUFBTSxvQkFBb0IsTUFBTTtBQUFBLEVBQ3JDLFlBQ0UsU0FDZ0IsTUFDQSxZQUNBLFNBQ2hCO0FBQ0EsVUFBTSxPQUFPO0FBSkc7QUFDQTtBQUNBO0FBR2hCLFNBQUssT0FBTztBQUFBLEVBQ2Q7QUFDRjtpSUFBQTtBQUVPLE1BQU0sbUJBQW1CLFlBQVk7QUFBQSxFQUMxQyxZQUNFLFNBQ0EsTUFDQSxZQUNBLFNBQ0E7QUFDQSxVQUFNLFNBQVMsU0FBUyxJQUFJLElBQUksWUFBWSxPQUFPO0FBQ25ELFNBQUssT0FBTztBQUFBLEVBQ2Q7QUFDRjsrSEFBQTtBQUVPLE1BQU0sMEJBQTBCLFdBQVc7QUFBQSxFQUNoRCxjQUFjO0FBQ1osVUFBTSxnREFBZ0QsZUFBZTtBQUNyRSxTQUFLLE9BQU87QUFBQSxFQUNkO0FBQ0Y7NklBQUE7QUFFTyxNQUFNLDBCQUEwQixXQUFXO0FBQUEsRUFDaEQsWUFBWSxTQUFpQixTQUFtQztBQUM5RCxVQUFNLFNBQVMsaUJBQWlCLEtBQUssT0FBTztBQUM1QyxTQUFLLE9BQU87QUFBQSxFQUNkO0FBQ0Y7NklBQUE7QUFFTyxNQUFNLDBCQUEwQixZQUFZO0FBQUEsRUFDakQsY0FBYztBQUNaLFVBQU0sNENBQTRDLGdCQUFnQixHQUFHO0FBQ3JFLFNBQUssT0FBTztBQUFBLEVBQ2Q7QUFDRjs2SUFBQTtBQUVPLE1BQU0sdUJBQXVCLFlBQVk7QUFBQSxFQUM5QyxZQUNFLFVBQVUsbUVBQ00sWUFDaEI7QUFDQSxVQUFNLFNBQVMsdUJBQXVCLEdBQUc7QUFGekI7QUFHaEIsU0FBSyxPQUFPO0FBQUEsRUFDZDtBQUNGO3VJQUFBO0FBRU8sTUFBTSx3QkFBd0IsWUFBWTtBQUFBLEVBQy9DLFlBQVksU0FBaUI7QUFDM0IsVUFBTSxTQUFTLG9CQUFvQixHQUFHO0FBQ3RDLFNBQUssT0FBTztBQUFBLEVBQ2Q7QUFDRjt5SUFBQTtBQUVPLE1BQU0sc0JBQXNCLFlBQVk7QUFBQSxFQUM3QyxZQUFZLFVBQWtCO0FBQzVCLFVBQU0sdUJBQXVCLFFBQVEsSUFBSSxhQUFhLEdBQUc7QUFDekQsU0FBSyxPQUFPO0FBQUEsRUFDZDtBQUNGO3FJQUFBO0FBRU8sTUFBTSwyQkFBMkIsWUFBWTtBQUFBLEVBQ2xELFlBQVksU0FBaUI7QUFDM0IsVUFBTSxTQUFTLHVCQUF1QixHQUFHO0FBQ3pDLFNBQUssT0FBTztBQUFBLEVBQ2Q7QUFDRjsrSUFBQSIsIm5hbWVzIjpbXSwiaWdub3JlTGlzdCI6W10sInNvdXJjZXMiOlsiZXJyb3JzLnRzIl0sInNvdXJjZXNDb250ZW50IjpbIi8qKlxuICogQ3VzdG9tIGVycm9yIGNsYXNzZXMgZm9yIE1DUC1UaWtUb2tcbiAqL1xuXG5leHBvcnQgY2xhc3MgVGlrVG9rRXJyb3IgZXh0ZW5kcyBFcnJvciB7XG4gIGNvbnN0cnVjdG9yKFxuICAgIG1lc3NhZ2U6IHN0cmluZyxcbiAgICBwdWJsaWMgcmVhZG9ubHkgY29kZTogc3RyaW5nLFxuICAgIHB1YmxpYyByZWFkb25seSBzdGF0dXNDb2RlPzogbnVtYmVyLFxuICAgIHB1YmxpYyByZWFkb25seSBkZXRhaWxzPzogUmVjb3JkPHN0cmluZywgdW5rbm93bj5cbiAgKSB7XG4gICAgc3VwZXIobWVzc2FnZSk7XG4gICAgdGhpcy5uYW1lID0gJ1Rpa1Rva0Vycm9yJztcbiAgfVxufVxuXG5leHBvcnQgY2xhc3MgT0F1dGhFcnJvciBleHRlbmRzIFRpa1Rva0Vycm9yIHtcbiAgY29uc3RydWN0b3IoXG4gICAgbWVzc2FnZTogc3RyaW5nLFxuICAgIGNvZGU6IHN0cmluZyxcbiAgICBzdGF0dXNDb2RlPzogbnVtYmVyLFxuICAgIGRldGFpbHM/OiBSZWNvcmQ8c3RyaW5nLCB1bmtub3duPlxuICApIHtcbiAgICBzdXBlcihtZXNzYWdlLCBgT0FVVEhfJHtjb2RlfWAsIHN0YXR1c0NvZGUsIGRldGFpbHMpO1xuICAgIHRoaXMubmFtZSA9ICdPQXV0aEVycm9yJztcbiAgfVxufVxuXG5leHBvcnQgY2xhc3MgVG9rZW5FeHBpcmVkRXJyb3IgZXh0ZW5kcyBPQXV0aEVycm9yIHtcbiAgY29uc3RydWN0b3IoKSB7XG4gICAgc3VwZXIoJ0FjY2VzcyB0b2tlbiBoYXMgZXhwaXJlZC4gUGxlYXNlIHJlZnJlc2ggaXQuJywgJ1RPS0VOX0VYUElSRUQnKTtcbiAgICB0aGlzLm5hbWUgPSAnVG9rZW5FeHBpcmVkRXJyb3InO1xuICB9XG59XG5cbmV4cG9ydCBjbGFzcyBJbnZhbGlkR3JhbnRFcnJvciBleHRlbmRzIE9BdXRoRXJyb3Ige1xuICBjb25zdHJ1Y3RvcihtZXNzYWdlOiBzdHJpbmcsIGRldGFpbHM/OiBSZWNvcmQ8c3RyaW5nLCB1bmtub3duPikge1xuICAgIHN1cGVyKG1lc3NhZ2UsICdJTlZBTElEX0dSQU5UJywgNDAwLCBkZXRhaWxzKTtcbiAgICB0aGlzLm5hbWUgPSAnSW52YWxpZEdyYW50RXJyb3InO1xuICB9XG59XG5cbmV4cG9ydCBjbGFzcyBVbmF1dGhvcml6ZWRFcnJvciBleHRlbmRzIFRpa1Rva0Vycm9yIHtcbiAgY29uc3RydWN0b3IoKSB7XG4gICAgc3VwZXIoJ1VuYXV0aG9yaXplZC4gUGxlYXNlIGF1dGhlbnRpY2F0ZSBmaXJzdC4nLCAnVU5BVVRIT1JJWkVEJywgNDAxKTtcbiAgICB0aGlzLm5hbWUgPSAnVW5hdXRob3JpemVkRXJyb3InO1xuICB9XG59XG5cbmV4cG9ydCBjbGFzcyBSYXRlTGltaXRFcnJvciBleHRlbmRzIFRpa1Rva0Vycm9yIHtcbiAgY29uc3RydWN0b3IoXG4gICAgbWVzc2FnZSA9ICdSYXRlIGxpbWl0IGV4Y2VlZGVkLiBQbGVhc2Ugd2FpdCBiZWZvcmUgbWFraW5nIGFub3RoZXIgcmVxdWVzdC4nLFxuICAgIHB1YmxpYyByZWFkb25seSByZXRyeUFmdGVyPzogbnVtYmVyXG4gICkge1xuICAgIHN1cGVyKG1lc3NhZ2UsICdSQVRFX0xJTUlUX0VYQ0VFREVEJywgNDI5KTtcbiAgICB0aGlzLm5hbWUgPSAnUmF0ZUxpbWl0RXJyb3InO1xuICB9XG59XG5cbmV4cG9ydCBjbGFzcyBWYWxpZGF0aW9uRXJyb3IgZXh0ZW5kcyBUaWtUb2tFcnJvciB7XG4gIGNvbnN0cnVjdG9yKG1lc3NhZ2U6IHN0cmluZykge1xuICAgIHN1cGVyKG1lc3NhZ2UsICdWQUxJREFUSU9OX0VSUk9SJywgNDAwKTtcbiAgICB0aGlzLm5hbWUgPSAnVmFsaWRhdGlvbkVycm9yJztcbiAgfVxufVxuXG5leHBvcnQgY2xhc3MgTm90Rm91bmRFcnJvciBleHRlbmRzIFRpa1Rva0Vycm9yIHtcbiAgY29uc3RydWN0b3IocmVzb3VyY2U6IHN0cmluZykge1xuICAgIHN1cGVyKGBSZXNvdXJjZSBub3QgZm91bmQ6ICR7cmVzb3VyY2V9YCwgJ05PVF9GT1VORCcsIDQwNCk7XG4gICAgdGhpcy5uYW1lID0gJ05vdEZvdW5kRXJyb3InO1xuICB9XG59XG5cbmV4cG9ydCBjbGFzcyBDb25maWd1cmF0aW9uRXJyb3IgZXh0ZW5kcyBUaWtUb2tFcnJvciB7XG4gIGNvbnN0cnVjdG9yKG1lc3NhZ2U6IHN0cmluZykge1xuICAgIHN1cGVyKG1lc3NhZ2UsICdDT05GSUdVUkFUSU9OX0VSUk9SJywgNTAwKTtcbiAgICB0aGlzLm5hbWUgPSAnQ29uZmlndXJhdGlvbkVycm9yJztcbiAgfVxufVxuIl0sImZpbGUiOiIvc3JjL2NvcmUvZXJyb3JzLnRzIn0=

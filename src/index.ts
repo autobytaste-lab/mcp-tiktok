@@ -1,569 +1,1352 @@
-#!/usr/bin/env node
 /**
- * TikTok MCP Server
- *
- * Security model
- * ──────────────
- * • App credentials (client_key, client_secret) are read ONLY from environment
- *   variables – never accepted as tool parameters.
- * • Access tokens are stored in ~/.config/mcp-tiktok/tokens.json (mode 0o600)
- *   after the OAuth flow and retrieved automatically by every tool.
- * • Token values are never returned to the MCP client.
- * • All API-calling tools auto-refresh the access token on 401 / expiry.
- *
- * Required env vars
- * ─────────────────
- *   TIKTOK_CLIENT_KEY      – app client key
- *   TIKTOK_CLIENT_SECRET   – app client secret
- *   TIKTOK_REDIRECT_URI    – optional default redirect URI
- *   TIKTOK_ACCESS_TOKEN    – optional override (skips token file, useful in CI)
+ * MCP Server for TikTok - Phase 2: Login Kit Integration
  */
 
-// ── Load .env for local development (silently skipped if absent) ──────────────
-import { readFileSync, existsSync } from "fs";
-import { resolve, dirname } from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dotenvPath = resolve(__dirname, "..", ".env");
-if (existsSync(dotenvPath)) {
-  for (const line of readFileSync(dotenvPath, "utf-8").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-    if (key && !(key in process.env)) process.env[key] = val;
-  }
-}
-
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import * as fs from "fs";
-
-import { buildAuthUrl, generatePKCE, generateState, DEFAULT_SCOPES } from "./auth.js";
-import { TikTokClient, calcVideoChunks, sleep } from "./tiktok-client.js";
-import { getClientKey, getClientSecret, getRedirectUri } from "./config.js";
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
 import {
-  saveTokens,
-  getAccessToken,
-  getRefreshToken,
-  getTokenInfo,
-  clearTokens,
-} from "./token-store.js";
-import type { PrivacyLevel, PostMode } from "./types.js";
+  OAuthTokens,
+  OAuthResponse,
+  Scope,
+  AVAILABLE_SCOPES,
+} from './core/types.js';
+import { oauthClient } from './auth/oauth-client.js';
+import { tokenManager } from './auth/token-manager.js';
+import { logger } from './utils/logger.js';
+import { LoginKitClient } from './login-kit/client.js';
+import type { UserInfoField } from './login-kit/types.js';
+import { DisplayAPIClient } from './display-api/client.js';
+import { ContentPostingClient, sleep } from './content-posting/client.js';
+import { ResearchAPIClient } from './research-api/client.js';
 
-// ─── Server ───────────────────────────────────────────────────────────────────
+// Create MCP server instance
+const server = new McpServer({
+  name: 'mcp-tiktok',
+  version: '1.0.0',
+});
 
-const server = new McpServer({ name: "mcp-tiktok", version: "1.0.0" });
-
-// ─── Shared schema constants ──────────────────────────────────────────────────
-
-const PRIVACY_LEVELS = [
-  "PUBLIC_TO_EVERYONE",
-  "MUTUAL_FOLLOW_FRIENDS",
-  "FOLLOWER_OF_CREATOR",
-  "SELF_ONLY",
-] as const;
-
-const POST_MODES = ["DIRECT_POST", "MEDIA_UPLOAD"] as const;
-
-// ─── Response helpers ─────────────────────────────────────────────────────────
-
-function ok(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-}
-
-function fail(message: string) {
-  return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true };
-}
+// ============================================================================
+// OAuth Tools (Phase 1)
+// ============================================================================
 
 /**
- * Wraps an async operation, automatically refreshing the access token once
- * if the API returns a 401 / token-expired error.
+ * Initialize OAuth flow and return authorization URL
  */
-async function run<T>(
-  fn: () => Promise<T>,
-): Promise<ReturnType<typeof ok> | ReturnType<typeof fail>> {
-  const attempt = async () => {
-    try {
-      return ok(await fn());
-    } catch (err) {
-      return null; // signals that we should inspect the error
-    }
-  };
-
-  try {
-    const result = ok(await fn());
-    return result;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isAuthError =
-      msg.includes("Access token has expired") ||
-      msg.includes("HTTP 401") ||
-      msg.toLowerCase().includes("token_expired") ||
-      msg.toLowerCase().includes("token_invalid");
-
-    if (isAuthError) {
-      // Try silent token refresh, then retry once
-      try {
-        const clientKey = getClientKey();
-        const clientSecret = getClientSecret();
-        const refreshToken = getRefreshToken();
-        const tempClient = new TikTokClient();
-        const tokens = await tempClient.refreshToken({ clientKey, clientSecret, refreshToken });
-        saveTokens(tokens);
-      } catch {
-        // Refresh itself failed – return the original error with a hint
-        return fail(`${msg} (auto-refresh also failed – run tiktok_refresh_token manually)`);
-      }
-
-      try {
-        return ok(await fn());
-      } catch (retryErr) {
-        return fail(retryErr instanceof Error ? retryErr.message : String(retryErr));
-      }
-    }
-
-    return fail(msg);
-  }
-}
-
-// ─── Tool 1: Get authorization URL ───────────────────────────────────────────
-
 server.tool(
-  "tiktok_get_auth_url",
-  [
-    "Generate a TikTok OAuth 2.0 authorization URL (PKCE).",
-    "TIKTOK_CLIENT_KEY and optional TIKTOK_REDIRECT_URI are read from env vars.",
-    "Steps: (1) Call this tool. (2) Open auth_url in a browser and authorize.",
-    "(3) Copy the 'code' param from the redirect URL. (4) Call tiktok_exchange_code.",
-  ].join(" "),
+  'tiktok_oauth_init',
+  'Initialize TikTok OAuth 2.0 + PKCE flow. Returns an authorization URL that the user must open in their browser.',
   {
-    redirect_uri: z
-      .string()
-      .optional()
-      .describe("Override TIKTOK_REDIRECT_URI. Must be registered in the TikTok developer portal."),
     scopes: z
-      .array(z.string())
+      .array(z.enum(['user.info.basic', 'user.info.email', 'user.info.phone_number', 'video.list', 'video.publish'] as const))
       .optional()
-      .describe(`OAuth scopes. Defaults to: ${DEFAULT_SCOPES.join(", ")}`),
+      .describe('OAuth scopes to request. Default: ["user.info.basic"]'),
+    state: z.string().optional().describe('State parameter for CSRF protection (auto-generated if not provided)'),
   },
-  async ({ redirect_uri, scopes }) => {
-    return run(async () => {
-      const clientKey = getClientKey();
-      const resolvedUri = getRedirectUri(redirect_uri);
-      const { codeVerifier, codeChallenge } = generatePKCE();
-      const state = generateState();
-      const authUrl = buildAuthUrl({
-        clientKey,
-        redirectUri: resolvedUri,
-        scopes: scopes && scopes.length > 0 ? scopes : DEFAULT_SCOPES,
-        codeChallenge,
-        state,
-      });
-      return {
-        auth_url: authUrl,
-        code_verifier: codeVerifier,
-        state,
-        next_step:
-          "Open auth_url in a browser. After authorizing, copy the 'code' query parameter " +
-          "from the redirect URL and pass it to tiktok_exchange_code.",
-      };
-    });
-  },
-);
+  async ({ scopes, state }) => {
+    try {
+      // Use default scopes if none provided
+      const requestedScopes: Scope[] = scopes?.length ? scopes : ['user.info.basic'];
+      
+      // Generate random state if not provided
+      const finalState = state || `state_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
-// ─── Tool 2: Exchange code for tokens ────────────────────────────────────────
+      logger.info('Initializing OAuth flow', { scopes: requestedScopes });
 
-server.tool(
-  "tiktok_exchange_code",
-  [
-    "Exchange the OAuth authorization code for access + refresh tokens.",
-    "Credentials are read from env vars; tokens are saved to",
-    "~/.config/mcp-tiktok/tokens.json (mode 0600) and NEVER returned to the client.",
-  ].join(" "),
-  {
-    code: z.string().describe("Authorization code from the OAuth redirect URL"),
-    redirect_uri: z
-      .string()
-      .optional()
-      .describe("Must match the redirect_uri used in tiktok_get_auth_url"),
-    code_verifier: z.string().describe("PKCE code_verifier returned by tiktok_get_auth_url"),
-  },
-  async ({ code, redirect_uri, code_verifier }) => {
-    return run(async () => {
-      const tokens = await new TikTokClient().exchangeCode({
-        clientKey: getClientKey(),
-        clientSecret: getClientSecret(),
-        code,
-        redirectUri: getRedirectUri(redirect_uri),
-        codeVerifier: code_verifier,
-      });
-      saveTokens(tokens);
-      return {
-        success: true,
-        open_id: tokens.open_id,
-        scope: tokens.scope,
-        expires_in_seconds: tokens.expires_in,
-        message: "Tokens saved. You can now call other tiktok_* tools without providing credentials.",
-      };
-    });
-  },
-);
+      // Get client credentials from environment
+      const clientId = process.env.TIKTOK_CLIENT_KEY;
+      const redirectUri = process.env.TIKTOK_REDIRECT_URI;
 
-// ─── Tool 3: Refresh token ────────────────────────────────────────────────────
-
-server.tool(
-  "tiktok_refresh_token",
-  "Refresh the stored access token using the stored refresh token. Updates the token file.",
-  {},
-  async () => {
-    return run(async () => {
-      const tokens = await new TikTokClient().refreshToken({
-        clientKey: getClientKey(),
-        clientSecret: getClientSecret(),
-        refreshToken: getRefreshToken(),
-      });
-      saveTokens(tokens);
-      return {
-        success: true,
-        open_id: tokens.open_id,
-        scope: tokens.scope,
-        expires_in_seconds: tokens.expires_in,
-        message: "Access token refreshed and saved.",
-      };
-    });
-  },
-);
-
-// ─── Tool 4: Revoke token ─────────────────────────────────────────────────────
-
-server.tool(
-  "tiktok_revoke_token",
-  "Revoke the stored access token on TikTok's server and delete the local token file.",
-  {},
-  async () => {
-    return run(async () => {
-      await new TikTokClient().revokeToken({
-        clientKey: getClientKey(),
-        clientSecret: getClientSecret(),
-        token: getAccessToken(),
-      });
-      clearTokens();
-      return { success: true, message: "Token revoked and local token file deleted." };
-    });
-  },
-);
-
-// ─── Tool 5: Token status ─────────────────────────────────────────────────────
-
-server.tool(
-  "tiktok_token_status",
-  "Show stored token metadata (expiry, scopes, open_id). Token values are never exposed.",
-  {},
-  async () => run(async () => getTokenInfo()),
-);
-
-// ─── Tool 6: Query creator info ───────────────────────────────────────────────
-
-server.tool(
-  "tiktok_get_creator_info",
-  [
-    "Query the authenticated creator's posting capabilities.",
-    "Returns available privacy levels, max video duration, and whether duet/stitch/comments are disabled.",
-    "Call this before posting to confirm what options are available for this creator.",
-  ].join(" "),
-  {},
-  async () => run(async () => new TikTokClient(getAccessToken()).getCreatorInfo()),
-);
-
-// ─── Tool 7: Post video ───────────────────────────────────────────────────────
-
-server.tool(
-  "tiktok_post_video",
-  [
-    "Post a video to the authenticated creator's TikTok account.",
-    "Upload options: (a) video_url – TikTok pulls from a verified-domain URL (no file transfer needed).",
-    "(b) video_path – local file is uploaded in 10 MB chunks.",
-    "post_mode DIRECT_POST publishes immediately; MEDIA_UPLOAD sends to creator inbox for review.",
-    "Returns publish_id. Use tiktok_wait_for_post or tiktok_check_post_status to track progress.",
-  ].join(" "),
-  {
-    title: z
-      .string()
-      .max(2200)
-      .describe("Caption / title (max 2200 chars, hashtags and @mentions supported)"),
-    privacy_level: z
-      .enum(PRIVACY_LEVELS)
-      .describe("Visibility. Run tiktok_get_creator_info to see available options."),
-    video_url: z
-      .string()
-      .optional()
-      .describe("PULL_FROM_URL: public video URL from a TikTok-verified domain"),
-    video_path: z
-      .string()
-      .optional()
-      .describe("FILE_UPLOAD: absolute path to a local MP4 video file"),
-    post_mode: z
-      .enum(POST_MODES)
-      .optional()
-      .default("DIRECT_POST")
-      .describe("DIRECT_POST = publish now; MEDIA_UPLOAD = send to creator inbox"),
-    disable_duet: z.boolean().optional().default(false),
-    disable_comment: z.boolean().optional().default(false),
-    disable_stitch: z.boolean().optional().default(false),
-    video_cover_timestamp_ms: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe("Thumbnail position in milliseconds"),
-    brand_content_toggle: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Mark as branded content (paid partnership)"),
-    brand_organic_toggle: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Mark as organic brand content"),
-  },
-  async ({
-    title,
-    privacy_level,
-    video_url,
-    video_path,
-    post_mode,
-    disable_duet,
-    disable_comment,
-    disable_stitch,
-    video_cover_timestamp_ms,
-    brand_content_toggle,
-    brand_organic_toggle,
-  }) => {
-    return run(async () => {
-      if (!video_url && !video_path) {
-        throw new Error("Provide either video_url (PULL_FROM_URL) or video_path (FILE_UPLOAD).");
-      }
-      if (video_url && video_path) {
-        throw new Error("Provide either video_url or video_path, not both.");
-      }
-
-      const client = new TikTokClient(getAccessToken());
-      const mode = (post_mode ?? "DIRECT_POST") as PostMode;
-
-      const postInfo = {
-        title,
-        privacy_level: privacy_level as PrivacyLevel,
-        disable_duet: disable_duet ?? false,
-        disable_comment: disable_comment ?? false,
-        disable_stitch: disable_stitch ?? false,
-        ...(video_cover_timestamp_ms !== undefined && { video_cover_timestamp_ms }),
-        ...(brand_content_toggle && { brand_content_toggle }),
-        ...(brand_organic_toggle && { brand_organic_toggle }),
-      };
-
-      if (video_url) {
-        const initFn = mode === "MEDIA_UPLOAD"
-          ? client.initInboxVideoPost.bind(client)
-          : client.initVideoPost.bind(client);
-
-        const result = await initFn({
-          post_info: postInfo,
-          source_info: { source: "PULL_FROM_URL", video_url },
-        });
+      if (!clientId) {
         return {
-          publish_id: result.publish_id,
-          source: "PULL_FROM_URL",
-          post_mode: mode,
-          message:
-            "Video post initiated. TikTok is downloading from the URL. " +
-            "Call tiktok_wait_for_post or tiktok_check_post_status to track progress.",
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_CLIENT_KEY',
+                message: 'TIKTOK_CLIENT_KEY environment variable is not set. Please configure it before using OAuth tools.',
+              },
+            }, null, 2),
+          }],
         };
       }
 
-      if (!fs.existsSync(video_path!)) throw new Error(`Video file not found: ${video_path}`);
+      if (!redirectUri) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_REDIRECT_URI',
+                message: 'TIKTOK_REDIRECT_URI environment variable is not set. Please configure it before using OAuth tools.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
 
-      const videoSize = fs.statSync(video_path!).size;
-      const { chunkSize, totalChunkCount } = calcVideoChunks(videoSize);
-
-      const initFn = mode === "MEDIA_UPLOAD"
-        ? client.initInboxVideoPost.bind(client)
-        : client.initVideoPost.bind(client);
-
-      const result = await initFn({
-        post_info: postInfo,
-        source_info: {
-          source: "FILE_UPLOAD",
-          video_size: videoSize,
-          chunk_size: chunkSize,
-          total_chunk_count: totalChunkCount,
-        },
-      });
-
-      await client.uploadVideoFile(result.upload_url!, video_path!);
+      // Generate authorization URL with PKCE
+      const authUrl = await oauthClient.generateAuthUrl(
+        clientId,
+        redirectUri,
+        requestedScopes,
+        finalState
+      );
 
       return {
-        publish_id: result.publish_id,
-        source: "FILE_UPLOAD",
-        post_mode: mode,
-        video_size_bytes: videoSize,
-        chunks_uploaded: totalChunkCount,
-        message:
-          "Video uploaded. TikTok is processing it asynchronously. " +
-          "Call tiktok_wait_for_post or tiktok_check_post_status to track progress.",
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              authorization_url: authUrl,
+              state: finalState,
+              instructions: [
+                '1. Open the authorization_url in your browser',
+                '2. Log in to TikTok and authorize your app',
+                '3. You will be redirected to your redirect_uri with a code parameter',
+                '4. Copy the code from the URL (e.g., ?code=ABC123...)',
+                '5. Call tiktok_exchange_code with the code to complete authentication',
+              ],
+            },
+          }, null, 2),
+        }],
       };
-    });
-  },
+    } catch (error) {
+      logger.error('OAuth init failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'OAUTH_INIT_FAILED',
+              message: `Failed to initialize OAuth: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
 );
 
-// ─── Tool 8: Post images ──────────────────────────────────────────────────────
-
+/**
+ * Exchange authorization code for access token
+ */
 server.tool(
-  "tiktok_post_images",
-  [
-    "Post a single photo or carousel (up to 35 images) to the authenticated creator's TikTok.",
-    "Image URLs must be from a TikTok-verified domain (PULL_FROM_URL only).",
-    "photo_cover_index is 1-based (1 = first image).",
-    "post_mode DIRECT_POST publishes now; MEDIA_UPLOAD sends to creator inbox.",
-    "Returns publish_id. Use tiktok_wait_for_post or tiktok_check_post_status to track progress.",
-  ].join(" "),
+  'tiktok_exchange_code',
+  'Exchange the authorization code (from OAuth callback) for access and refresh tokens. Tokens are stored securely.',
   {
-    title: z.string().max(2200).describe("Caption / title (max 2200 chars)"),
-    privacy_level: z
-      .enum(PRIVACY_LEVELS)
-      .describe("Visibility. Run tiktok_get_creator_info to see available options."),
-    image_urls: z
-      .array(z.string().url())
-      .min(1)
-      .max(35)
-      .describe("Public image URLs (JPEG/PNG/WEBP) from a verified domain. Up to 35 for a carousel."),
-    photo_cover_index: z
+    code: z.string().describe('Authorization code from TikTok redirect URL'),
+    state: z.string().optional().describe('State parameter that was used in oauth_init call'),
+  },
+  async ({ code, state }) => {
+    try {
+      logger.info('Exchanging authorization code');
+
+      // Get redirect URI from environment
+      const redirectUri = process.env.TIKTOK_REDIRECT_URI;
+
+      if (!redirectUri) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_REDIRECT_URI',
+                message: 'TIKTOK_REDIRECT_URI is not configured.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Exchange code for tokens
+      const oauthResponse: OAuthResponse = await oauthClient.exchangeCode(
+        code,
+        redirectUri,
+        state || ''
+      );
+
+      // Store tokens securely
+      await tokenManager.storeTokens(oauthResponse, oauthResponse.open_id);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              message: 'Authentication successful! Tokens stored securely.',
+              open_id: oauthResponse.open_id,
+              scope: oauthResponse.scope,
+              expires_in: oauthResponse.expires_in,
+              token_file: tokenManager.getTokenFilePath(),
+              next_steps: [
+                'You can now use Display API tools (tiktok_display_*)',
+                'Check token status with tiktok_token_status',
+                'Token will auto-refresh when expired for supported operations',
+              ],
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Code exchange failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'CODE_EXCHANGE_FAILED',
+              message: `Failed to exchange code: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Refresh expired access token
+ */
+server.tool(
+  'tiktok_refresh_token',
+  'Refresh the expired access token using the stored refresh token.',
+  {},
+  async () => {
+    try {
+      // Get stored tokens
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.refresh_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'NO_REFRESH_TOKEN',
+                message: 'No refresh token found. Please authenticate again using tiktok_oauth_init.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const clientId = process.env.TIKTOK_CLIENT_KEY;
+
+      if (!clientId) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_CLIENT_KEY',
+                message: 'TIKTOK_CLIENT_KEY is not configured.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Refresh token
+      const newTokens: OAuthTokens = await oauthClient.refreshToken(
+        storedTokens.refresh_token,
+        clientId
+      );
+
+      // Update stored tokens
+      await tokenManager.storeTokens(newTokens, storedTokens.open_id);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              message: 'Access token refreshed successfully',
+              expires_in: newTokens.expires_in,
+              scope: newTokens.scope,
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Token refresh failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'TOKEN_REFRESH_FAILED',
+              message: `Failed to refresh token: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Revoke token and logout
+ */
+server.tool(
+  'tiktok_revoke_token',
+  'Revoke the access token and delete stored tokens (logout).',
+  {},
+  async () => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              data: {
+                message: 'No tokens found to revoke. You are already logged out.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Revoke token with TikTok
+      await oauthClient.revokeToken(storedTokens.access_token);
+
+      // Delete stored tokens
+      await tokenManager.deleteTokens();
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              message: 'Successfully logged out. Tokens revoked and deleted.',
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Token revocation failed', { error });
+      // Still delete local tokens even if revoke fails
+      try {
+        await tokenManager.deleteTokens();
+      } catch {}
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              message: 'Local tokens deleted. (Remote revocation may have failed)',
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Check token status
+ */
+server.tool(
+  'tiktok_token_status',
+  'Check the current token status, expiry time, and scopes. Does not expose raw token values.',
+  {},
+  async () => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              data: {
+                authenticated: false,
+                message: 'No tokens found. Please authenticate using tiktok_oauth_init.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const expiresAt = storedTokens.expires_at || 0;
+      const isExpired = now > expiresAt;
+      const timeUntilExpiry = expiresAt - now;
+      const hoursUntilExpiry = Math.max(0, Math.round(timeUntilExpiry / 3600));
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              authenticated: true,
+              open_id: storedTokens.open_id,
+              scope: storedTokens.scope,
+              is_expired: isExpired,
+              expires_at: new Date(expiresAt).toISOString(),
+              hours_until_expiry: hoursUntilExpiry,
+              has_refresh_token: !!storedTokens.refresh_token,
+              token_file: tokenManager.getTokenFilePath(),
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Token status check failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'TOKEN_STATUS_FAILED',
+              message: `Failed to check token status: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Login Kit Tools (Phase 2)
+// ============================================================================
+
+const loginKitClient = new LoginKitClient();
+
+/**
+ * Get TikTok user profile information
+ */
+server.tool(
+  'tiktok_login_get_user_info',
+  'Get the authenticated user\'s profile information including display name, avatar URLs, and email (if authorized).',
+  {
+    fields: z
+      .array(z.enum(['open_id', 'display_name', 'avatar_url_50x50', 'avatar_url_100x100', 'avatar_url_720x720', 'email'] as const))
+      .optional()
+      .describe('Fields to retrieve. Default: ["open_id", "display_name", "avatar_url_50x50"]'),
+  },
+  async ({ fields }) => {
+    try {
+      // Get stored tokens
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'NOT_AUTHENTICATED',
+                message: 'No access token found. Please authenticate using tiktok_oauth_init and tiktok_exchange_code first.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if token is expired
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      const isExpired = now > expiresAt;
+
+      if (isExpired) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'TOKEN_EXPIRED',
+                message: 'Access token has expired. Please refresh using tiktok_refresh_token.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Determine which fields to request based on available scopes
+      const requestedFields: UserInfoField[] = fields?.length 
+        ? fields 
+        : ['open_id', 'display_name', 'avatar_url_50x50'];
+
+      // Filter fields based on granted scopes
+      const grantedScopes = storedTokens.scope || [];
+      const hasEmailScope = grantedScopes.includes('user.info.email');
+      
+      const filteredFields = requestedFields.filter(field => {
+        if (field === 'email' && !hasEmailScope) {
+          return false; // Email requires user.info.email scope
+        }
+        return true;
+      });
+
+      logger.info('Fetching user info', { fields: filteredFields });
+
+      // Fetch user info from TikTok
+      const userInfo = await loginKitClient.getUserInfo(
+        storedTokens.access_token,
+        filteredFields
+      );
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              user_info: userInfo,
+              avatar_urls: {
+                thumbnail_50x50: loginKitClient.getAvatarUrl(userInfo, 50),
+                medium_100x100: loginKitClient.getAvatarUrl(userInfo, 100),
+                high_res_720x720: loginKitClient.getAvatarUrl(userInfo, 720),
+              },
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Get user info failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'GET_USER_INFO_FAILED',
+              message: `Failed to get user info: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Display API Tools (Phase 3)
+// ============================================================================
+
+const displayAPIClient = new DisplayAPIClient();
+
+/**
+ * Query videos by keyword or hashtag
+ */
+server.tool(
+  'tiktok_display_query_videos',
+  'Search for TikTok videos by keyword or hashtag. Returns video metadata including title, cover URL, play count, etc.',
+  {
+    keyword: z.string().min(1).max(100).describe('Search keyword or hashtag (without # symbol)'),
+    max_count: z
       .number()
       .int()
       .min(1)
+      .max(20)
       .optional()
-      .default(1)
-      .describe("1-based index of the cover image (default: 1)"),
-    post_mode: z
-      .enum(POST_MODES)
+      .default(10)
+      .describe('Maximum number of results to return (1-20, default: 10)'),
+    cursor: z
+      .number()
+      .int()
+      .min(0)
       .optional()
-      .default("DIRECT_POST")
-      .describe("DIRECT_POST = publish now; MEDIA_UPLOAD = send to creator inbox"),
-    description: z.string().optional().describe("Extended description"),
-    disable_comment: z.boolean().optional().default(false),
-    auto_add_music: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("Let TikTok automatically add background music"),
+      .default(0)
+      .describe('Pagination cursor for fetching more results'),
   },
-  async ({
-    title,
-    privacy_level,
-    image_urls,
-    photo_cover_index,
-    post_mode,
-    description,
-    disable_comment,
-    auto_add_music,
-  }) => {
-    return run(async () => {
-      const result = await new TikTokClient(getAccessToken()).initPhotoPost({
-        post_info: {
-          title,
-          privacy_level: privacy_level as PrivacyLevel,
-          disable_comment: disable_comment ?? false,
-          auto_add_music: auto_add_music ?? true,
-          ...(description && { description }),
-        },
-        source_info: {
-          source: "PULL_FROM_URL",
-          photo_cover_index: photo_cover_index ?? 1,
-          photo_images: image_urls,
-        },
-        post_mode: (post_mode ?? "DIRECT_POST") as PostMode,
-        media_type: "PHOTO",
+  async ({ keyword, max_count, cursor }) => {
+    try {
+      // Get stored tokens
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'NOT_AUTHENTICATED',
+                message: 'No access token found. Please authenticate using tiktok_oauth_init and tiktok_exchange_code first.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if token is expired
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      const isExpired = now > expiresAt;
+
+      if (isExpired) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'TOKEN_EXPIRED',
+                message: 'Access token has expired. Please refresh using tiktok_refresh_token.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if user has video.list scope
+      const grantedScopes = storedTokens.scope || [];
+      if (!grantedScopes.includes('video.list')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_SCOPE',
+                message: 'The video.list scope is required for this operation. Please re-authenticate with the video.list scope.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Querying videos', { keyword, max_count, cursor });
+
+      // Query videos from TikTok
+      const response = await displayAPIClient.queryVideos(storedTokens.access_token, {
+        keyword,
+        max_count,
+        cursor,
       });
+
       return {
-        publish_id: result.publish_id,
-        image_count: image_urls.length,
-        cover_index: photo_cover_index ?? 1,
-        post_mode: post_mode ?? "DIRECT_POST",
-        message:
-          "Photo post initiated. " +
-          "Call tiktok_wait_for_post or tiktok_check_post_status to track progress.",
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              videos: response.data.videos.map(video => ({
+                id: video.id,
+                title: video.title,
+                description: video.description,
+                cover_url: video.cover_url,
+                play_url: video.play_url,
+                duration: video.duration,
+                create_time: new Date(video.create_time * 1000).toISOString(),
+                author: {
+                  id: video.author.id,
+                  username: video.author.unique_id,
+                  nickname: video.author.nickname,
+                  avatar_url: video.author.avatar_url,
+                },
+                stats: {
+                  plays: displayAPIClient.formatNumber(video.stats.play_count),
+                  likes: displayAPIClient.formatNumber(video.stats.like_count),
+                  comments: displayAPIClient.formatNumber(video.stats.comment_count),
+                  shares: displayAPIClient.formatNumber(video.stats.share_count),
+                },
+                hashtags: video.hashtags,
+                music: {
+                  title: video.music.title,
+                  author: video.music.author,
+                  duration: video.music.duration,
+                },
+              })),
+              pagination: {
+                cursor: response.data.cursor,
+                has_more: response.data.has_more,
+                total_returned: response.data.videos.length,
+              },
+            },
+          }, null, 2),
+        }],
       };
-    });
-  },
+    } catch (error) {
+      logger.error('Query videos failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'QUERY_VIDEOS_FAILED',
+              message: `Failed to query videos: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
 );
 
-// ─── Tool 9: Check post status ────────────────────────────────────────────────
-
+/**
+ * List a user's recent videos
+ */
 server.tool(
-  "tiktok_check_post_status",
-  [
-    "Check the current publish status of a TikTok post by publish_id (single poll).",
-    "Statuses: PROCESSING_UPLOAD | PROCESSING_DOWNLOAD | SEND_TO_USER_INBOX | PUBLISH_COMPLETE | FAILED.",
-    "For automatic polling until done, use tiktok_wait_for_post instead.",
-  ].join(" "),
+  'tiktok_display_list_videos',
+  'List the authenticated user\'s recent videos. Requires video.list scope.',
   {
-    publish_id: z
-      .string()
-      .describe("Publish ID returned by tiktok_post_video or tiktok_post_images"),
+    max_count: z
+      .number()
+      .int()
+      .min(1)
+      .max(20)
+      .optional()
+      .default(10)
+      .describe('Maximum number of results to return (1-20, default: 10)'),
+    cursor: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe('Pagination cursor for fetching more results'),
+  },
+  async ({ max_count, cursor }) => {
+    try {
+      // Get stored tokens
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'NOT_AUTHENTICATED',
+                message: 'No access token found. Please authenticate using tiktok_oauth_init and tiktok_exchange_code first.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if token is expired
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      const isExpired = now > expiresAt;
+
+      if (isExpired) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'TOKEN_EXPIRED',
+                message: 'Access token has expired. Please refresh using tiktok_refresh_token.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if user has video.list scope
+      const grantedScopes = storedTokens.scope || [];
+      if (!grantedScopes.includes('video.list')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'MISSING_SCOPE',
+                message: 'The video.list scope is required for this operation. Please re-authenticate with the video.list scope.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Listing user videos', { open_id: storedTokens.open_id });
+
+      // List videos from TikTok
+      const response = await displayAPIClient.listVideos(storedTokens.access_token, {
+        open_id: storedTokens.open_id,
+        max_count,
+        cursor,
+      });
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              videos: response.data.videos.map(video => ({
+                id: video.id,
+                title: video.title,
+                description: video.description,
+                cover_url: video.cover_url,
+                play_url: video.play_url,
+                duration: video.duration,
+                create_time: new Date(video.create_time * 1000).toISOString(),
+                author: {
+                  id: video.author.id,
+                  username: video.author.unique_id,
+                  nickname: video.author.nickname,
+                  avatar_url: video.author.avatar_url,
+                },
+                stats: {
+                  plays: displayAPIClient.formatNumber(video.stats.play_count),
+                  likes: displayAPIClient.formatNumber(video.stats.like_count),
+                  comments: displayAPIClient.formatNumber(video.stats.comment_count),
+                  shares: displayAPIClient.formatNumber(video.stats.share_count),
+                },
+                hashtags: video.hashtags,
+                music: {
+                  title: video.music.title,
+                  author: video.music.author,
+                  duration: video.music.duration,
+                },
+              })),
+              pagination: {
+                cursor: response.data.cursor,
+                has_more: response.data.has_more,
+                total_returned: response.data.videos.length,
+              },
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('List videos failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'LIST_VIDEOS_FAILED',
+              message: `Failed to list videos: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Get user profile information by open_id
+ */
+server.tool(
+  'tiktok_display_get_user_info',
+  'Get TikTok user profile information by their open_id. Requires user.info.basic scope.',
+  {
+    open_id: z.string().describe('The user\'s open_id to look up'),
+  },
+  async ({ open_id }) => {
+    try {
+      // Get stored tokens
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'NOT_AUTHENTICATED',
+                message: 'No access token found. Please authenticate using tiktok_oauth_init and tiktok_exchange_code first.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Check if token is expired
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      const isExpired = now > expiresAt;
+
+      if (isExpired) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: {
+                code: 'TOKEN_EXPIRED',
+                message: 'Access token has expired. Please refresh using tiktok_refresh_token.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Getting user info', { open_id });
+
+      // Get user info from TikTok
+      const userInfo = await displayAPIClient.getUserInfo(storedTokens.access_token, open_id);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              user_info: {
+                open_id: userInfo.open_id,
+                display_name: userInfo.display_name,
+                avatar_urls: {
+                  thumbnail_50x50: userInfo.avatar_url_50x50,
+                  medium_100x100: userInfo.avatar_url_100x100,
+                  high_res_720x720: userInfo.avatar_url_720x720,
+                },
+              },
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Get user info failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: {
+              code: 'GET_USER_INFO_FAILED',
+              message: `Failed to get user info: ${error}`,
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Content Posting API Tools (Phase 4)
+// ============================================================================
+
+const contentPostingClient = new ContentPostingClient();
+
+/**
+ * Get creator posting capabilities
+ */
+server.tool(
+  'tiktok_posting_get_creator_info',
+  'Query the authenticated creator\'s posting capabilities including available privacy levels, max video duration, and restrictions.',
+  {},
+  async () => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Getting creator info');
+      const creatorInfo = await contentPostingClient.getCreatorInfo();
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              creator_info: {
+                avatar_url: creatorInfo.creator_avatar_url,
+                username: creatorInfo.creator_username,
+                nickname: creatorInfo.creator_nickname,
+                privacy_levels_available: creatorInfo.privacy_level_options,
+                max_video_duration_seconds: creatorInfo.max_video_post_duration_sec,
+                restrictions: {
+                  comments_disabled: creatorInfo.comment_disabled,
+                  duet_disabled: creatorInfo.duet_disabled,
+                  stitch_disabled: creatorInfo.stitch_disabled,
+                },
+              },
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Get creator info failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'GET_CREATOR_INFO_FAILED', message: `Failed to get creator info: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Post a video (PULL_FROM_URL method)
+ */
+server.tool(
+  'tiktok_posting_post_video',
+  'Post a video to TikTok. Supports PULL_FROM_URL (TikTok downloads from verified domain) or FILE_UPLOAD (local file).',
+  {
+    title: z.string().max(2200).describe('Video caption/title (max 2200 chars)'),
+    privacy_level: z.enum(['PUBLIC_TO_EVERYONE', 'MUTUAL_FOLLOW_FRIENDS', 'FOLLOWER_OF_CREATOR', 'SELF_ONLY'] as const)
+      .describe('Visibility level'),
+    video_url: z.string().url().optional().describe('Video URL from verified domain (PULL_FROM_URL)'),
+    video_path: z.string().optional().describe('Local file path for upload (FILE_UPLOAD)'),
+    post_mode: z.enum(['DIRECT_POST', 'MEDIA_UPLOAD'] as const)
+      .optional()
+      .default('DIRECT_POST')
+      .describe('DIRECT_POST=publish now, MEDIA_UPLOAD=send to inbox'),
+    disable_duet: z.boolean().optional().default(false),
+    disable_comment: z.boolean().optional().default(false),
+    disable_stitch: z.boolean().optional().default(false),
+  },
+  async ({ title, privacy_level, video_url, video_path, post_mode, disable_duet, disable_comment, disable_stitch }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      if (!video_url && !video_path) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'INVALID_PARAMS', message: 'Provide either video_url or video_path' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Posting video', { mode: post_mode, source: video_url ? 'PULL_FROM_URL' : 'FILE_UPLOAD' });
+
+      const client = new ContentPostingClient(storedTokens.access_token);
+      
+      if (video_url) {
+        // PULL_FROM_URL method
+        const result = await client.initVideoPost({
+          post_info: { title, privacy_level, disable_duet, disable_comment, disable_stitch },
+          source_info: { source: 'PULL_FROM_URL', video_url },
+        });
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              data: {
+                publish_id: result.publish_id,
+                source: 'PULL_FROM_URL',
+                post_mode: post_mode,
+                message: 'Video post initiated. Use tiktok_posting_check_status to track progress.',
+              },
+            }, null, 2),
+          }],
+        };
+      }
+
+      // FILE_UPLOAD method - not fully implemented in this version
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'NOT_IMPLEMENTED', message: 'FILE_UPLOAD requires additional setup. Use PULL_FROM_URL instead.' },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Post video failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'POST_VIDEO_FAILED', message: `Failed to post video: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Post images/photo carousel
+ */
+server.tool(
+  'tiktok_posting_post_images',
+  'Post a photo or carousel (up to 35 images) to TikTok. Images must be from verified domains.',
+  {
+    title: z.string().max(2200).describe('Caption/title'),
+    privacy_level: z.enum(['PUBLIC_TO_EVERYONE', 'MUTUAL_FOLLOW_FRIENDS', 'FOLLOWER_OF_CREATOR', 'SELF_ONLY'] as const)
+      .describe('Visibility level'),
+    image_urls: z.array(z.string().url()).min(1).max(35)
+      .describe('Image URLs from verified domain (1-35 images)'),
+    photo_cover_index: z.number().int().min(1).optional().default(1)
+      .describe('Cover image index (1-based, default: 1)'),
+    post_mode: z.enum(['DIRECT_POST', 'MEDIA_UPLOAD'] as const)
+      .optional()
+      .default('DIRECT_POST'),
+    description: z.string().optional().describe('Extended description'),
+    disable_comment: z.boolean().optional().default(false),
+  },
+  async ({ title, privacy_level, image_urls, photo_cover_index, post_mode, description, disable_comment }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Posting images', { count: image_urls.length });
+
+      const client = new ContentPostingClient(storedTokens.access_token);
+      const result = await client.initPhotoPost({
+        post_info: { title, privacy_level, disable_comment, auto_add_music: true, ...(description && { description }) },
+        source_info: { source: 'PULL_FROM_URL', photo_cover_index, photo_images: image_urls },
+        post_mode,
+        media_type: 'PHOTO',
+      });
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              publish_id: result.publish_id,
+              image_count: image_urls.length,
+              cover_index: photo_cover_index,
+              post_mode,
+              message: 'Photo post initiated. Use tiktok_posting_check_status to track progress.',
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Post images failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'POST_IMAGES_FAILED', message: `Failed to post images: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Check publish status
+ */
+server.tool(
+  'tiktok_posting_check_status',
+  'Check the current publish status of a post by publish_id.',
+  {
+    publish_id: z.string().describe('Publish ID from post_video or post_images'),
   },
   async ({ publish_id }) => {
-    return run(async () => {
-      const status = await new TikTokClient(getAccessToken()).getPublishStatus(publish_id);
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Checking post status', { publish_id });
+
+      const client = new ContentPostingClient(storedTokens.access_token);
+      const status = await client.getPublishStatus(publish_id);
+
       return {
-        publish_id,
-        ...status,
-        ...(status.status === "PUBLISH_COMPLETE" && { note: "Content is now live on TikTok." }),
-        ...(status.status === "FAILED" && {
-          note: `Post failed. Reason: ${status.fail_reason ?? "unknown"}`,
-        }),
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              publish_id,
+              status: status.status,
+              fail_reason: status.fail_reason,
+              post_ids: status.publicaly_available_post_id,
+              note: status.status === 'PUBLISH_COMPLETE' ? 'Content is now live on TikTok.' :
+                   status.status === 'FAILED' ? `Post failed. Reason: ${status.fail_reason || 'unknown'}` : 'Still processing...',
+            },
+          }, null, 2),
+        }],
       };
-    });
-  },
+    } catch (error) {
+      logger.error('Check status failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'CHECK_STATUS_FAILED', message: `Failed to check status: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
 );
 
-// ─── Tool 10: Wait for post (polling) ────────────────────────────────────────
-
+/**
+ * Wait for post completion (polling)
+ */
 server.tool(
-  "tiktok_wait_for_post",
-  [
-    "Poll publish status repeatedly until PUBLISH_COMPLETE, FAILED, or timeout.",
-    "Returns the final status with post IDs when the content goes live.",
-    "More convenient than manually calling tiktok_check_post_status in a loop.",
-  ].join(" "),
+  'tiktok_posting_wait_for_post',
+  'Poll publish status repeatedly until PUBLISH_COMPLETE, FAILED, or timeout.',
   {
-    publish_id: z.string().describe("Publish ID to poll"),
-    timeout_seconds: z
-      .number()
-      .int()
-      .min(10)
-      .max(600)
-      .optional()
-      .default(120)
-      .describe("Max seconds to wait before giving up (default 120, max 600)"),
-    poll_interval_seconds: z
-      .number()
-      .int()
-      .min(3)
-      .max(30)
-      .optional()
-      .default(5)
-      .describe("Seconds between status checks (default 5)"),
+    publish_id: z.string().describe('Publish ID to poll'),
+    timeout_seconds: z.number().int().min(10).max(600).optional().default(120)
+      .describe('Max seconds to wait (default 120, max 600)'),
+    poll_interval_seconds: z.number().int().min(3).max(30).optional().default(5)
+      .describe('Seconds between checks (default 5)'),
   },
   async ({ publish_id, timeout_seconds, poll_interval_seconds }) => {
-    return run(async () => {
-      const client = new TikTokClient(getAccessToken());
-      const timeoutMs = (timeout_seconds ?? 120) * 1000;
-      const intervalMs = (poll_interval_seconds ?? 5) * 1000;
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const client = new ContentPostingClient(storedTokens.access_token);
+      const timeoutMs = timeout_seconds * 1000;
+      const intervalMs = poll_interval_seconds * 1000;
       const deadline = Date.now() + timeoutMs;
       let attempts = 0;
 
@@ -571,49 +1354,393 @@ server.tool(
         attempts++;
         const status = await client.getPublishStatus(publish_id);
 
-        if (status.status === "PUBLISH_COMPLETE") {
+        if (status.status === 'PUBLISH_COMPLETE') {
           return {
-            publish_id,
-            status: "PUBLISH_COMPLETE",
-            attempts,
-            post_ids: status.publicaly_available_post_id ?? [],
-            note: "Content is now live on TikTok.",
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                data: {
+                  publish_id,
+                  status: 'PUBLISH_COMPLETE',
+                  attempts,
+                  post_ids: status.publicaly_available_post_id,
+                  note: 'Content is now live on TikTok.',
+                },
+              }, null, 2),
+            }],
           };
         }
 
-        if (status.status === "FAILED") {
+        if (status.status === 'FAILED') {
           return {
-            publish_id,
-            status: "FAILED",
-            attempts,
-            fail_reason: status.fail_reason ?? "unknown",
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                data: {
+                  publish_id,
+                  status: 'FAILED',
+                  attempts,
+                  fail_reason: status.fail_reason || 'unknown',
+                },
+              }, null, 2),
+            }],
           };
         }
 
-        // Still processing – wait before next poll (unless we'd exceed deadline)
         const waitMs = Math.min(intervalMs, deadline - Date.now());
         if (waitMs > 0) await sleep(waitMs);
       }
 
       return {
-        publish_id,
-        status: "TIMEOUT",
-        attempts,
-        note: `Still processing after ${timeout_seconds}s. Call tiktok_check_post_status to continue monitoring.`,
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            data: {
+              publish_id,
+              status: 'TIMEOUT',
+              attempts,
+              note: `Still processing after ${timeout_seconds}s. Call tiktok_posting_check_status to continue monitoring.`,
+            },
+          }, null, 2),
+        }],
       };
-    });
-  },
+    } catch (error) {
+      logger.error('Wait for post failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'WAIT_FOR_POST_FAILED', message: `Failed to wait for post: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
 );
 
-// ─── Start server ─────────────────────────────────────────────────────────────
+// ============================================================================
+// Research API Tools (Phase 5)
+// ============================================================================
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write("TikTok MCP server started (stdio)\n");
-}
+const researchAPIClient = new ResearchAPIClient();
 
-main().catch((err) => {
-  process.stderr.write(`Fatal: ${err instanceof Error ? err.message : err}\n`);
-  process.exit(1);
-});
+/**
+ * Execute SQL-like query on TikTok data
+ */
+server.tool(
+  'tiktok_research_query',
+  'Execute a SQL-like query against TikTok\'s research database. Supports SELECT, WHERE, ORDER BY, LIMIT.',
+  {
+    sql: z.string().describe('SQL-like query string'),
+  },
+  async ({ sql }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Executing research query', { sql });
+
+      const client = new ResearchAPIClient(storedTokens.access_token);
+      const result = await client.executeQuery({ sql });
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              results: result.data,
+              total_count: result.total_count,
+              has_more: result.has_more,
+              cursor: result.cursor,
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Research query failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'RESEARCH_QUERY_FAILED', message: `Failed to execute query: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Query videos by hashtag
+ */
+server.tool(
+  'tiktok_research_query_by_hashtag',
+  'Query videos by hashtag within a time range.',
+  {
+    hashtag: z.string().describe('Hashtag to search for (without #)'),
+    days_ago: z.number().int().min(1).max(90).optional().default(7)
+      .describe('Look back this many days (1-90, default: 7)'),
+    limit: z.number().int().min(1).max(100).optional().default(20)
+      .describe('Max results to return (1-100, default: 20)'),
+  },
+  async ({ hashtag, days_ago, limit }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Querying by hashtag', { hashtag, days_ago });
+
+      const client = new ResearchAPIClient(storedTokens.access_token);
+      const timeRange = ResearchAPIClient.createTimeRangeForLastDays(days_ago);
+      const result = await client.queryByHashtag(hashtag, timeRange, limit);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              videos: result.data,
+              total_count: result.total_count,
+              has_more: result.has_more,
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Query by hashtag failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'QUERY_BY_HASHTAG_FAILED', message: `Failed to query by hashtag: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Get top videos by engagement
+ */
+server.tool(
+  'tiktok_research_top_by_engagement',
+  'Get top videos by engagement (likes + shares) within a time range.',
+  {
+    days_ago: z.number().int().min(1).max(90).optional().default(7)
+      .describe('Look back this many days'),
+    limit: z.number().int().min(1).max(100).optional().default(20),
+  },
+  async ({ days_ago, limit }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Getting top by engagement', { days_ago });
+
+      const client = new ResearchAPIClient(storedTokens.access_token);
+      const timeRange = ResearchAPIClient.createTimeRangeForLastDays(days_ago);
+      const result = await client.queryTopByEngagement(timeRange, limit);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              videos: result.data,
+              total_count: result.total_count,
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Top by engagement failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'TOP_BY_ENGAGEMENT_FAILED', message: `Failed to get top videos: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+/**
+ * Count videos by hashtag
+ */
+server.tool(
+  'tiktok_research_count_by_hashtag',
+  'Count total videos for a hashtag within a time range.',
+  {
+    hashtag: z.string().describe('Hashtag to count (without #)'),
+    days_ago: z.number().int().min(1).max(90).optional().default(7),
+  },
+  async ({ hashtag, days_ago }) => {
+    try {
+      const storedTokens = await tokenManager.getTokens();
+
+      if (!storedTokens?.access_token) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'NOT_AUTHENTICATED', message: 'No access token found.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = Date.now();
+      const expiresAt = storedTokens.expires_at || 0;
+      if (now > expiresAt) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: { code: 'TOKEN_EXPIRED', message: 'Access token has expired.' },
+            }, null, 2),
+          }],
+        };
+      }
+
+      logger.info('Counting by hashtag', { hashtag });
+
+      const client = new ResearchAPIClient(storedTokens.access_token);
+      const timeRange = ResearchAPIClient.createTimeRangeForLastDays(days_ago);
+      const result = await client.countByHashtag(hashtag, timeRange);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            data: {
+              hashtag,
+              count: result.count,
+              period_days: days_ago,
+            },
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      logger.error('Count by hashtag failed', { error });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: { code: 'COUNT_BY_HASHTAG_FAILED', message: `Failed to count: ${error}` },
+          }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Start Server
+// ============================================================================
+
+logger.info('MCP-TikTok server starting...');
+logger.info(`Phase 1: Core Infrastructure & OAuth ✅`);
+logger.info(`Phase 2: Login Kit Integration ✅`);
+logger.info(`Phase 3: Display API ✅`);
+logger.info(`Phase 4: Content Posting API ✅`);
+logger.info(`Phase 5: Research API ✅`);
+logger.info('Tools registered:');
+logger.info('  OAuth: tiktok_oauth_init, tiktok_exchange_code, tiktok_refresh_token, tiktok_revoke_token, tiktok_token_status');
+logger.info('  Login Kit: tiktok_login_get_user_info');
+logger.info('  Display API: tiktok_display_query_videos, tiktok_display_list_videos, tiktok_display_get_user_info');
+logger.info('  Content Posting: tiktok_posting_get_creator_info, tiktok_posting_post_video, tiktok_posting_post_images, tiktok_posting_check_status, tiktok_posting_wait_for_post');
+logger.info('  Research API: tiktok_research_query, tiktok_research_query_by_hashtag, tiktok_research_top_by_engagement, tiktok_research_count_by_hashtag');
+
+export default server;
